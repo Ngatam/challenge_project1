@@ -1,133 +1,113 @@
-################################# Import ####################################
+################################## Import ######################################
 
+import math
 import rclpy
 
-from rclpy.node import Node # Pour pouvoir créer un Node
-from sensor_msgs.msg import LaserScan # Importation des types de messages des lasers
-from nav_msgs.msg import Odometry # Importation des types de messages de l'odométrie
-from geometry_msgs.msg import Twist # Importation des types de messages pour la commande en vitesse
-from std_msgs.msg import String # Pour des tests
+from rclpy.node import Node
+from nav_msgs.msg import Odometry # Pour la position du robot
+from sensor_msgs.msg import LaserScan # Pour les données du Laser
+from geometry_msgs.msg import Twist # Pour les commandes de mouvement
 
 
 
-################################# Class ####################################
+################################## Class ######################################
 
-class NodeChallenge1(Node):
-
+class Challenge1_Node(Node):
     def __init__(self):
-        super().__init__('Node_Challenge_1')
-        self.subscription_scanner = self.create_subscription(LaserScan , '/scan',  self.slistener_callback_scan, 10) # Node 1 - Subscriber 1 qui va lire des données de type ‘LaserScan’ dans le topic ‘/Scan’ avec le callback callback_scan
-        
-        self.subscription_position = self.create_subscription(Odometry , '/odom',  self.listener_callback_pos, 10) # Node 2 - Subscriber 2 qui va lire des données de type ‘Odometry’ dans le topic ‘/odm’ avec le callback callback_scan        
-        
-        self.publisher_deplacement = self.create_publisher(Twist, "/cmd_vel", 10) # Node 3 - Publisher qui va publier un message de type ‘Twist’ dans le topic ‘/cmd_vel 
-        timer_period = 0.5  # Période de publication en seconde
-        self.timer = self.create_timer(timer_period, self.timer_callback) # Fonction pour la période de publication        
-        self.subscription  # Prévient si variable pas utilisée
-        self.i = 0 # Initialisation du compteur
+        super().__init__('wall_follower_node')  # Nom du nœud ROS
 
+        # Souscription aux données LiDAR
+        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
 
-    def listener_callback_scan(self, msg):
-        # Envoie des données de la lecteur dans le terminale de commande
-        self.get_logger().info("J'ai ", msg.ranges[0], " à 0°") 
-        self.get_logger().info("J'ai ", msg.ranges[360], " à 90°") 
-        self.get_logger().info("J'ai ", msg.ranges[720], " à 180°") 
-              
-        
-    def listener_callback_position(self, msg):
-        position = msg.pose.pose.position # Position X,Y,Z actuel du robot
-        orientation = msg.pose.pose.orientation # Rotation alpha, beta, gamma, delta actuel du robot
-        
-        # Assignation pour calculs
-        (x_actuel, y_actuel, z_actuel) = (position.x, position.y, position.z)
-        (alpha_actuel, beta_actuel, gamma_actuel, delta_actuel) = (orientation.x, orientation.y, orientation.z, orientation.w)
-        
-        self.get_logger().info("Je suis en ", x_actuel, " sur X") 
-        
-        
-    def timer_callback(self):
-        msg = String()
-        msg.data = 'Hello World: %d' % self.i # Création du message qui va être publié
-        self.publisher_.publish(msg) # Publication du message sur le topic
-        self.get_logger().info('Publishing: "%s"' % msg.data) # Renvoie la publication sur le terminale de commande
-        self.i += 1 # Itération pour savoir combien de message sont publié
-        
-        """   
-        def run(self):
-            # Supprimer les distances infinis du nuages de points de données des scanner
-            # Convertir le nuage de point en positions x,y
-            # Aller à la positon x, y en envoyant les commandes en vitesse sur le topic '/cmd_vel' en choisissant celle avec le x tel   que x>x_actuel
-        while True:
-        
-            # Get character from keyboard
-            mykey = click.getchar()  # Read the key that have been pushed
-            if mykey in self.keycode.keys():
-                char = self.keycode[mykey]  # Rename the keys according to the parameters previously defined
-           
-                # Twist data:
-                # Vector3  linear
-            	#   float64 x -> message.linear.x
-                #   float64 y -> message.linear.y
-                #   float64 z -> message.linear.z
-                
-                # Vector3  angular
-                #	float64 x -> message.angular.x
-                #	float64 y -> message.angular.y
-                #	float64 z -> message.angular.z
+        # Souscription à la position du robot
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
 
-                if char == 'up':    # UP key
-                    linear = float(1)
-                    angular = float(0)
-                    
-                if char == 'down':  # DOWN key
-                    linear = float(-1)
-                    angular = float(0)
-                    
-                if char == 'right':  # RIGHT key
-                    linear = float(0)
-                    angular = float(-1)
-                   
-                if char == 'left':  # LEFT key               
-                    linear = float(0)
-                    angular = float(1)
-                    
-                if char == 'stop':  # S key              
-                    linear = float(0)
-                    angular = float(0)        
-                    
-                if char == 'quit':  # Q key
-                    return False
-                    
-                self.get_logger().info(f"\n Key pressed: {char}")
-                self.message.linear.x = linear * self.linear_scale
-                self.message.angular.z = angular * self.angular_scale
+        # Publication des commandes de mouvement
+        self.publisher_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
 
-                self.publisher_.publish(self.message)
+        # Timer pour appeler la boucle de contrôle toutes les 0.2 secondes
+        self.create_timer(0.2, self.control_loop)
 
-    """
+        # Variables internes
+        self.scan_data = None
+        self.X_actuel = 0.0                  # Position actuelle sur l'axe X
+        self.best_distance = 0.0             # Distance vers le mur le plus loin
+        self.best_angle = 0.0                # Angle vers le mur le plus loin
 
-################################# Main ####################################
+        # Distance minimale de sécurité (0.5 m)
+        self.securite_distance = 0.5
 
+    # Callback du LiDAR : analyse les données dans le cône [-90°, +90°]
+    def scan_callback(self, msg):
+        angle_min = msg.angle_min
+        angle_max = msg.angle_max
+        angle_increment = msg.angle_increment
+        ranges = msg.ranges  # Tableau des distances
+
+        # Plage d'indices correspondant à -90° et +90°
+        min_angle = -math.pi / 2
+        max_angle = +math.pi / 2
+
+        index_min = int((min_angle - angle_min) / angle_increment)
+        index_max = int((max_angle - angle_min) / angle_increment)
+
+        # Recherche de la distance maximale dans le cône frontal
+        max_dist = 0.0
+        best_idx = index_min
+        for i in range(index_min, index_max):
+            if 0 <= i < len(ranges):
+                d = ranges[i]
+                if math.isfinite(d) and d > max_dist:
+                    max_dist = d
+                    best_idx = i
+
+        # Mise à jour des valeurs optimales
+        self.best_distance = max_dist
+        self.best_angle = angle_min + best_idx * angle_increment
+
+    # Callback de l'odométrie : enregistre la position X actuelle
+    def odom_callback(self, msg):
+        self.X_actuel = msg.pose.pose.position.x
+
+    # Boucle principale de contrôle (appelée toutes les 0.2 s)
+    def control_loop(self):
+        msg = Twist()  # Message de commande
+
+        # Si aucune donnée de LiDAR n’est encore reçue
+        if self.best_distance == 0.0:
+            self.get_logger().info("En attente des données du LiDAR...")
+            return
+
+        # Si le mur est encore loin (> 0.5 m), on avance
+        if self.best_distance > self.securite_distance:
+            msg.linear.x = 0.2  # Avance constante sur l'axe X
+
+            # Tourne légèrement vers le mur le plus loin
+            msg.angular.z = 0.5 * self.best_angle
+
+            self.get_logger().info(
+                f"Avance vers angle {math.degrees(self.best_angle):.1f}° (dist={self.best_distance:.2f}m), X={self.X_actuel:.2f}"
+            )
+        else:
+            # Trop proche : on s'arrête
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.get_logger().info(
+                f"Mur trop proche ({self.best_distance:.2f}m). Stop. X={self.X_actuel:.2f}"
+            )
+
+        # Publication de la commande
+        self.publisher_cmd_vel.publish(msg)
+
+# Fonction principale
 def main(args=None):
-    print("Node 1 lancé")
-    rclpy.init(args=args)
+    rclpy.init(args=args)  # Initialisation de ROS 2
+    node = Challenge1_Node()  # Création du nœud
+    rclpy.spin(node)  # Boucle d'exécution (écoute des messages)
+    node.destroy_node()  # Destruction propre du nœud
+    rclpy.shutdown()  # Fermeture de ROS 2
 
-    node1 = NodeChallenge1()
-
-    rclpy.spin(node1)
-
-    
-    # Run keyboard reading and corresponding publications
-    teleop_node.run()
-
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    node1.destroy_node()
-    rclpy.shutdown()
-    
-
+# Exécution du script
 if __name__ == '__main__':
     main()
 
